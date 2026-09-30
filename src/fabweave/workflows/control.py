@@ -24,6 +24,7 @@ from fabweave.rework.authorization import ReworkPolicy, authorization_decision
 from fabweave.shipment.commit import Allocation, CommitLedger
 from fabweave.spc.control import western_electric_rules
 from fabweave.takt.monitor import TaktResult, takt_result
+from fabweave.yielding.excursion import ExcursionCase, ExcursionRegister, StepExposure, exposed_lots, suspect_window
 from fabweave.yielding.rollup import StepYield, route_yield
 
 
@@ -193,6 +194,74 @@ def record_containment(
         {"scope": list(scope)},
     )
     return ContainmentRecord(tuple(event.data["scope"]), event.sequence)
+
+
+@dataclass(frozen=True, slots=True)
+class YieldContainment:
+    case: ExcursionCase
+    created: bool
+    holds: tuple[HoldState, ...]
+
+
+def open_yield_containment(
+    register: ExcursionRegister,
+    case_id: str,
+    observations: list[tuple[int, float]],
+    center: float,
+    sigma: float,
+    exposures: list[StepExposure],
+    step: str,
+    graph: GenealogyGraph,
+    max_depth: int,
+    required_dispositions: set[str],
+    opened_at: int,
+) -> YieldContainment | None:
+    """Circle the WIP still affected by a yield excursion and hold it.
+
+    Returns ``None`` when the statistical rules trip no signal.  Otherwise the
+    suspect window starts at the last confirmed-good point, route exposures
+    inside that window seed the scope, genealogy expands it, and every scoped
+    lot is held behind the required dispositions plus retest recovery.
+    Reopening the same case id replays idempotently without moving state.
+    """
+
+    window = suspect_window(observations, center, sigma)
+    if window is None:
+        return None
+    seeds = exposed_lots(exposures, step, window)
+    scope = containment_scope(graph, list(seeds), max_depth)
+    case, created = register.open(case_id, scope, set(required_dispositions), window, opened_at)
+    return YieldContainment(case, created, tuple(case.hold_state(lot_id) for lot_id in case.scope))
+
+
+def record_disposition(case: ExcursionCase, event_id: str, disposition: str, occurred_at: int) -> Decision:
+    if disposition not in case.required_dispositions:
+        return deny(f"unknown_disposition:{disposition}", case_id=case.case_id)
+    applied = case.apply(event_id, occurred_at, "disposition_completed", disposition)
+    return allow(case_id=case.case_id, disposition=disposition, applied=applied, case_version=case.version)
+
+
+def record_retest(
+    case: ExcursionCase,
+    event_id: str,
+    values: list[float],
+    center: float,
+    sigma: float,
+    occurred_at: int,
+) -> Decision:
+    """Latch retest recovery only when the statistical rules come back clean."""
+
+    rules = western_electric_rules(values, center, sigma)
+    if rules:
+        return deny(*rules, case_id=case.case_id, retest_recovered=case.retest_recovered)
+    applied = case.apply(event_id, occurred_at, "retest_recovered", tuple(values))
+    return allow(case_id=case.case_id, applied=applied, retest_recovered=True, case_version=case.version)
+
+
+def containment_holds(case: ExcursionCase) -> dict[str, HoldState]:
+    """Effective per-lot holds, ready for :func:`rank_releasable`."""
+
+    return {lot_id: case.hold_state(lot_id) for lot_id in case.scope}
 
 
 def powered_assignment(

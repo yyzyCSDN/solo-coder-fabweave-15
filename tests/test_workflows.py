@@ -28,20 +28,25 @@ from fabweave.rework.authorization import ReworkPolicy, authorization_decision
 from fabweave.shipment.commit import CommitLedger
 from fabweave.spc.control import western_electric_rules
 from fabweave.takt.monitor import takt_result
+from fabweave.yielding.excursion import ExcursionCase, ExcursionRegister, ExcursionWindow, StepExposure, exposed_lots, suspect_window
 from fabweave.yielding.rollup import StepYield, route_yield
 from fabweave.workflows.control import (
     chamber_sample_decision,
+    containment_holds,
     containment_scope,
     dedicated_qualification,
     environmental_containment,
     evaluate_sample,
     material_readiness,
     merge_and_commit,
+    open_yield_containment,
     performance_summary,
     powered_assignment,
     qualified_assignment,
     rank_releasable,
     record_containment,
+    record_disposition,
+    record_retest,
     reserve_qualified,
     rework_release_decision,
 )
@@ -344,3 +349,107 @@ def test_dedicated_qualification_combines_both_policy_gates():
 def test_performance_summary_uses_filtered_takt_and_ordered_route_yield():
     summary = performance_summary([0, 10, 20], 5, 20, [StepYield("A", 10, 9), StepYield("B", 9, 8)], ["A", "B"])
     assert summary.takt.takt == 10 and summary.route_yield == pytest.approx(0.8)
+
+
+def test_suspect_window_starts_at_last_confirmed_good_point():
+    observations = [(20, 0.1), (10, 0.0), (30, 0.0), (40, 4.0), (20, 0.1)]
+    assert suspect_window(observations, 0, 1) == ExcursionWindow(30, 40)
+    assert suspect_window([(10, 5.0), (20, 0.0)], 0, 1) == ExcursionWindow(None, 20)
+    assert suspect_window([(10, 0.0), (20, 0.1)], 0, 1) is None
+    with pytest.raises(ValueError):
+        suspect_window([(10, 0.0), (10, 1.0)], 0, 1)
+
+
+def test_exposed_lots_selects_route_exposures_inside_the_window():
+    exposures = [
+        StepExposure("LOT-A", "ETCH", 25),
+        StepExposure("LOT-B", "ETCH", 35),
+        StepExposure("LOT-C", "ETCH", 40),
+        StepExposure("LOT-D", "DEP", 35),
+        StepExposure("LOT-E", "ETCH", 45),
+    ]
+    assert exposed_lots(exposures, "ETCH", ExcursionWindow(30, 40)) == ("LOT-B", "LOT-C")
+    assert exposed_lots(exposures, "ETCH", ExcursionWindow(None, 40)) == ("LOT-A", "LOT-B", "LOT-C")
+
+
+def test_yield_containment_circles_wip_from_last_good_point_via_route_and_genealogy():
+    graph = GenealogyGraph({"LOT-A": None, "LOT-B": "LOT-A", "LOT-C": "LOT-B", "LOT-X": None})
+    register = ExcursionRegister()
+    observations = [(10, 0.0), (20, 0.1), (30, 0.0), (40, 4.0)]
+    exposures = [StepExposure("LOT-B", "ETCH", 35), StepExposure("LOT-X", "ETCH", 35)]
+    containment = open_yield_containment(register, "YEX-1", observations, 0, 1, exposures, "ETCH", graph, 2, {"QA", "ENG"}, 50)
+    assert containment is not None and containment.created
+    assert containment.case.scope == ("LOT-A", "LOT-B", "LOT-C", "LOT-X")
+    assert {hold.hold_id for hold in containment.holds} == {f"YEX-1:{lot_id}" for lot_id in containment.case.scope}
+    for hold in containment.holds:
+        assert hold.required_dispositions == frozenset({"QA", "ENG"})
+        assert hold.active_blockers == frozenset({"RETEST_RECOVERY"})
+
+
+def test_yield_containment_returns_none_without_signal_and_replay_does_not_move_state():
+    graph = GenealogyGraph({"LOT-A": None, "LOT-B": "LOT-A"})
+    register = ExcursionRegister()
+    exposures = [StepExposure("LOT-B", "ETCH", 35)]
+    assert open_yield_containment(register, "YEX-0", [(10, 0.0), (20, 0.1)], 0, 1, exposures, "ETCH", graph, 2, {"QA"}, 50) is None
+    observations = [(10, 0.0), (20, 0.1), (30, 0.0), (40, 4.0)]
+    first = open_yield_containment(register, "YEX-1", observations, 0, 1, exposures, "ETCH", graph, 2, {"QA"}, 50)
+    replay = open_yield_containment(register, "YEX-1", observations, 0, 1, exposures, "ETCH", graph, 2, {"QA"}, 50)
+    assert replay is not None and not replay.created and replay.case is first.case
+    assert replay.case.scope == first.case.scope and replay.case.version == first.case.version
+    with pytest.raises(ValueError):
+        open_yield_containment(register, "YEX-1", observations, 0, 1, exposures, "ETCH", graph, 2, {"QA", "ENG"}, 50)
+
+
+def test_case_absorbs_duplicate_and_late_events_without_expanding_or_regressing():
+    case = ExcursionCase("YEX-1", ("LOT-A",), {"QA", "ENG"}, ExcursionWindow(30, 40), 50)
+    assert case.apply("EVT-1", 60, "disposition_completed", "QA")
+    assert not case.apply("EVT-1", 60, "disposition_completed", "QA")
+    with pytest.raises(ValueError):
+        case.apply("EVT-1", 60, "disposition_completed", "ENG")
+    assert not case.apply("EVT-2", 55, "disposition_completed", "ENG")
+    assert case.completed_dispositions == frozenset({"QA"})
+    assert case.apply("EVT-3", 70, "retest_recovered")
+    assert not case.apply("EVT-4", 65, "disposition_completed", "ENG")
+    assert case.completed_dispositions == frozenset({"QA"}) and case.retest_recovered
+    assert case.scope == ("LOT-A",) and case.version == 3 and case.as_of == 70
+    with pytest.raises(ValueError):
+        case.apply("EVT-5", 80, "disposition_completed", "VIP")
+
+
+def test_yield_release_requires_all_dispositions_and_retest_recovery():
+    case = ExcursionCase("YEX-1", ("LOT-A", "LOT-B"), {"QA", "ENG"}, ExcursionWindow(30, 40), 50)
+    case.apply("D-1", 60, "disposition_completed", "QA")
+    partial = case.release_decision("LOT-A", case.version, 70)
+    assert partial.reasons == ("missing_disposition:ENG", "active_blocker:RETEST_RECOVERY")
+    case.apply("D-2", 61, "disposition_completed", "ENG")
+    blocked = case.release_decision("LOT-A", case.version, 70)
+    assert blocked.reasons == ("active_blocker:RETEST_RECOVERY",)
+    case.apply("R-1", 62, "retest_recovered")
+    assert case.release_decision("LOT-A", case.version, 70).allowed
+    assert case.release_decision("LOT-B", case.version, 70).allowed
+    assert case.release_decision("LOT-Z", case.version, 70).reasons == ("lot_outside_containment_scope",)
+    assert case.release_decision("LOT-A", case.version - 1, 70).reasons == ("stale_hold_version",)
+
+
+def test_retest_recovery_only_latches_when_spc_clears():
+    case = ExcursionCase("YEX-1", ("LOT-A",), {"QA"}, ExcursionWindow(30, 40), 50)
+    failing = record_retest(case, "R-1", [0.0, 0.0, 4.0], 0, 1, 60)
+    assert not failing.allowed and "one_beyond_3_sigma" in failing.reasons and not case.retest_recovered
+    passing = record_retest(case, "R-2", [0.0, 0.1, 0.0], 0, 1, 61)
+    assert passing.allowed and passing.evidence["applied"] and case.retest_recovered
+    replay = record_retest(case, "R-2", [0.0, 0.1, 0.0], 0, 1, 61)
+    assert replay.allowed and not replay.evidence["applied"] and case.version == passing.evidence["case_version"]
+    unknown = record_disposition(case, "D-9", "VIP", 62)
+    assert unknown.reasons == ("unknown_disposition:VIP",) and case.completed_dispositions == frozenset()
+
+
+def test_containment_holds_block_dispatch_until_dispositions_and_retest_complete():
+    case = ExcursionCase("YEX-1", ("LOT-A",), {"QA"}, ExcursionWindow(30, 40), 50)
+    candidates = [DispatchCandidate("LOT-A", 1, 2), DispatchCandidate("LOT-B", 2, 2)]
+    holds = containment_holds(case)
+    assert [item.lot_id for item in rank_releasable(candidates, 70, holds, {"LOT-A": case.version})] == ["LOT-B"]
+    record_disposition(case, "D-1", "QA", 60)
+    assert [item.lot_id for item in rank_releasable(candidates, 70, containment_holds(case), {"LOT-A": case.version})] == ["LOT-B"]
+    record_retest(case, "R-1", [0.0, 0.1, 0.0], 0, 1, 61)
+    ranked = rank_releasable(candidates, 70, containment_holds(case), {"LOT-A": case.version})
+    assert [item.lot_id for item in ranked] == ["LOT-A", "LOT-B"]
