@@ -28,9 +28,11 @@ from fabweave.rework.authorization import ReworkPolicy, authorization_decision
 from fabweave.shipment.commit import CommitLedger
 from fabweave.spc.control import western_electric_rules
 from fabweave.takt.monitor import takt_result
+from fabweave.yielding.excursion import affected_wip, contain
 from fabweave.yielding.rollup import StepYield, route_yield
 from fabweave.workflows.control import (
     chamber_sample_decision,
+    complete_case_disposition,
     containment_scope,
     dedicated_qualification,
     environmental_containment,
@@ -41,9 +43,12 @@ from fabweave.workflows.control import (
     powered_assignment,
     qualified_assignment,
     rank_releasable,
+    record_case_retest,
     record_containment,
+    release_yield_containment,
     reserve_qualified,
     rework_release_decision,
+    start_yield_containment,
 )
 
 
@@ -344,3 +349,104 @@ def test_dedicated_qualification_combines_both_policy_gates():
 def test_performance_summary_uses_filtered_takt_and_ordered_route_yield():
     summary = performance_summary([0, 10, 20], 5, 20, [StepYield("A", 10, 9), StepYield("B", 9, 8)], ["A", "B"])
     assert summary.takt.takt == 10 and summary.route_yield == pytest.approx(0.8)
+
+
+def _yield_setup(positions, required=("QA",)):
+    graph = GenealogyGraph({lot: None for lot in positions})
+    log = EventLog()
+    rules = western_electric_rules([0, 0, 3.1], 0, 1)
+    start = start_yield_containment(log, "YC-1", ["ETCH", "DEP"], "ETCH", positions, graph, 1, set(required), rules, 100)
+    return log, start
+
+
+def test_yield_scope_circles_downstream_wip_and_genealogy_relatives_only():
+    graph = GenealogyGraph({"LOT-A": None, "LOT-B": "LOT-A", "LOT-C": "LOT-B", "LOT-D": None, "LOT-X": "LOT-D"})
+    route = ["LITHO", "ETCH", "DEP", "CMP"]
+    positions = {"LOT-A": "ETCH", "LOT-B": "DEP", "LOT-C": "LITHO", "LOT-D": "CMP"}
+    assert affected_wip(route, "ETCH", positions, graph, 2) == ("LOT-A", "LOT-B", "LOT-C", "LOT-D")
+    assert affected_wip(route, "CMP", positions, graph, 2) == ()
+
+
+def test_yield_scope_rejects_empty_duplicate_and_unknown_steps():
+    graph = GenealogyGraph({"LOT-A": None})
+    with pytest.raises(ValueError):
+        affected_wip([], "ETCH", {}, graph, 1)
+    with pytest.raises(ValueError):
+        affected_wip(["ETCH", "ETCH"], "ETCH", {}, graph, 1)
+    with pytest.raises(ValueError):
+        affected_wip(["ETCH"], "DEP", {}, graph, 1)
+    with pytest.raises(ValueError):
+        affected_wip(["ETCH"], "ETCH", {"LOT-A": "DEP"}, graph, 1)
+
+
+def test_yield_containment_start_is_idempotent_and_scope_cannot_drift():
+    graph = GenealogyGraph({"LOT-A": None, "LOT-B": "LOT-A"})
+    route = ["LITHO", "ETCH", "DEP"]
+    positions = {"LOT-A": "DEP", "LOT-B": "ETCH"}
+    log = EventLog()
+    rules = western_electric_rules([0, 0, 3.1], 0, 1)
+    first = start_yield_containment(log, "YC-1", route, "LITHO", positions, graph, 1, {"QA"}, rules, 100)
+    replay = start_yield_containment(log, "YC-1", route, "LITHO", positions, graph, 1, {"QA"}, rules, 100)
+    assert first == replay
+    assert first.case.scope == ("LOT-A", "LOT-B")
+    assert [hold.hold_id for hold in first.holds] == ["YC-1:LOT-A", "YC-1:LOT-B"]
+    with pytest.raises(ValueError):
+        start_yield_containment(log, "YC-1", route, "ETCH", positions, graph, 1, {"QA"}, rules, 100)
+    with pytest.raises(ValueError):
+        start_yield_containment(log, "YC-2", route, "LITHO", positions, graph, 1, {"QA"}, (), 100)
+
+
+def test_yield_case_events_cannot_expand_shrink_or_regress_state():
+    log, start = _yield_setup({"LOT-A": "DEP"}, required=("QA", "ENG"))
+    case = start.case
+    assert contain(case, ("LOT-A", "LOT-B"), 101) == case
+    assert contain(case, (), 101) == case
+    done = complete_case_disposition(log, case, "EVT-QA", "QA", 110).case
+    assert done.completed_dispositions == frozenset({"QA"}) and done.version == 3
+    assert complete_case_disposition(log, done, "EVT-QA", "QA", 110).case == done
+    assert complete_case_disposition(log, done, "EVT-LATE", "ENG", 105).case == done
+    assert record_case_retest(log, done, "EVT-RT-LATE", True, 105).case == done
+    recovered = record_case_retest(log, done, "EVT-RT", True, 120).case
+    assert recovered.retest_recovered
+    assert record_case_retest(log, recovered, "EVT-RT-2", False, 130).case == recovered
+
+
+def test_yield_release_requires_completed_dispositions_and_retest_recovery():
+    log, start = _yield_setup({"LOT-A": "DEP", "LOT-B": "DEP"})
+    case = start.case
+    hold = start.holds[0]
+    assert release_decision(hold, hold.version, 110).reasons == ("missing_disposition:QA", "active_blocker:retest_pending")
+    _, denied = release_yield_containment(log, case, "EVT-REL", case.version, 110)
+    assert denied.reasons == ("missing_disposition:QA", "retest_not_recovered")
+    assert len(log.read("yieldcase:YC-1")) == 1
+    case = complete_case_disposition(log, case, "EVT-QA", "QA", 120).case
+    _, denied = release_yield_containment(log, case, "EVT-REL-2", case.version, 125)
+    assert denied.reasons == ("retest_not_recovered",)
+    case = record_case_retest(log, case, "EVT-RT", True, 130).case
+    with pytest.raises(ValueError):
+        complete_case_disposition(log, case, "EVT-X", "UNKNOWN", 140)
+    released, decision = release_yield_containment(log, case, "EVT-REL-3", case.version, 140)
+    assert decision.allowed and released.case.released_at == 140
+    replay, decision = release_yield_containment(log, released.case, "EVT-REL-3", case.version, 140)
+    assert decision.allowed and decision.evidence["replay"] and replay == released
+    _, stale = release_yield_containment(log, released.case, "EVT-REL-4", 1, 150)
+    assert stale.reasons == ("stale_case_version",)
+    assert record_case_retest(log, released.case, "EVT-RT-2", False, 150).case == released.case
+    assert complete_case_disposition(log, released.case, "EVT-QA-2", "QA", 150).case == released.case
+
+
+def test_yield_containment_holds_gate_dispatch_until_release():
+    log, start = _yield_setup({"LOT-A": "DEP", "LOT-B": "DEP"})
+    candidates = [DispatchCandidate("LOT-C", 1, 2), DispatchCandidate("LOT-A", 1, 2), DispatchCandidate("LOT-B", 1, 2)]
+
+    def hold_map(containment):
+        return dict(zip(containment.case.scope, containment.holds))
+
+    ranked = rank_releasable(candidates, 110, hold_map(start), {})
+    assert [item.lot_id for item in ranked] == ["LOT-C"]
+    case = complete_case_disposition(log, start.case, "EVT-QA", "QA", 120).case
+    case = record_case_retest(log, case, "EVT-RT", True, 130).case
+    released, decision = release_yield_containment(log, case, "EVT-REL", case.version, 140)
+    assert decision.allowed
+    ranked = rank_releasable(candidates, 150, hold_map(released), {})
+    assert [item.lot_id for item in ranked] == ["LOT-A", "LOT-B", "LOT-C"]

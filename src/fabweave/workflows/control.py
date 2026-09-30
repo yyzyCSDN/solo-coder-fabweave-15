@@ -24,6 +24,16 @@ from fabweave.rework.authorization import ReworkPolicy, authorization_decision
 from fabweave.shipment.commit import Allocation, CommitLedger
 from fabweave.spc.control import western_electric_rules
 from fabweave.takt.monitor import TaktResult, takt_result
+from fabweave.yielding.excursion import (
+    YieldCase,
+    affected_wip,
+    case_holds,
+    complete_disposition,
+    contain,
+    open_case,
+    record_retest,
+    release_case,
+)
 from fabweave.yielding.rollup import StepYield, route_yield
 
 
@@ -193,6 +203,80 @@ def record_containment(
         {"scope": list(scope)},
     )
     return ContainmentRecord(tuple(event.data["scope"]), event.sequence)
+
+
+@dataclass(frozen=True, slots=True)
+class YieldContainment:
+    case: YieldCase
+    holds: tuple[HoldState, ...]
+
+
+def _yield_stream(case_id: str) -> str:
+    return f"yieldcase:{case_id}"
+
+
+def _append_case_event(log: EventLog, case: YieldCase, event_id: str, at: int, kind: str, data: dict[str, object]) -> None:
+    stream = _yield_stream(case.case_id)
+    log.append(stream, len(log.read(stream)), event_id, at, kind, data)
+
+
+def start_yield_containment(
+    log: EventLog,
+    request_id: str,
+    route: list[str],
+    good_step: str,
+    positions: dict[str, str],
+    graph: GenealogyGraph,
+    max_depth: int,
+    required_dispositions: set[str],
+    rules: tuple[str, ...],
+    at: int,
+) -> YieldContainment:
+    scope = affected_wip(route, good_step, positions, graph, max_depth)
+    case = contain(open_case(request_id, good_step, rules, frozenset(required_dispositions), at), scope, at)
+    log.append(
+        _yield_stream(request_id),
+        0,
+        request_id,
+        at,
+        "yield_containment_started",
+        {
+            "good_step": good_step,
+            "scope": list(case.scope),
+            "rules": sorted(case.rules),
+            "required_dispositions": sorted(required_dispositions),
+        },
+    )
+    return YieldContainment(case, case_holds(case))
+
+
+def complete_case_disposition(log: EventLog, case: YieldCase, event_id: str, name: str, at: int) -> YieldContainment:
+    if at < case.updated_at:
+        return YieldContainment(case, case_holds(case))
+    updated = complete_disposition(case, name, at)
+    _append_case_event(log, case, event_id, at, "disposition_completed", {"name": name})
+    return YieldContainment(updated, case_holds(updated))
+
+
+def record_case_retest(log: EventLog, case: YieldCase, event_id: str, recovered: bool, at: int) -> YieldContainment:
+    if at < case.updated_at:
+        return YieldContainment(case, case_holds(case))
+    updated = record_retest(case, recovered, at)
+    _append_case_event(log, case, event_id, at, "retest_recovered" if recovered else "retest_failed", {})
+    return YieldContainment(updated, case_holds(updated))
+
+
+def release_yield_containment(
+    log: EventLog,
+    case: YieldCase,
+    event_id: str,
+    expected_version: int,
+    at: int,
+) -> tuple[YieldContainment, Decision]:
+    updated, decision = release_case(case, expected_version, at)
+    if decision.allowed and updated is not case:
+        _append_case_event(log, case, event_id, at, "yield_case_released", {"scope": list(updated.scope)})
+    return YieldContainment(updated, case_holds(updated)), decision
 
 
 def powered_assignment(
